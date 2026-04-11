@@ -104,9 +104,12 @@ impl Compositor {
         }
     }
 
+    /// Drain the batch manager into a `DisplayList`. The display list
+    /// holds rect vertices, per-instance glyph quads, and an ordered
+    /// command list the renderer walks to dispatch each pipeline.
     #[inline]
-    pub fn finish(&mut self, vertices: &mut Vec<Vertex>) {
-        self.batches.build_display_list(vertices);
+    pub fn finish(&mut self, list: &mut crate::renderer::batch::DisplayList) {
+        self.batches.build_display_list(list);
         self.batches.reset();
     }
 
@@ -267,26 +270,30 @@ impl Compositor {
                         let coords = [img.min.0, img.min.1, img.max.0, img.max.1];
 
                         if entry.is_bitmap {
+                            // Color glyph (bitmap text). Atlas index is
+                            // 0-based; add 1 so layer 0 means "no texture".
                             let bitmap_color = [1.0, 1.0, 1.0, 1.0];
-                            // Get atlas index for this image (0-based), add 1 for layer (0 = no texture)
                             let atlas_layer = session
                                 .get_atlas_index(entry.image)
                                 .map(|idx| (idx + 1) as i32)
                                 .unwrap_or(1);
-                            self.batches.add_image_rect(
+                            self.batches.add_text_color_glyph(
                                 &glyph_rect,
                                 depth,
                                 &bitmap_color,
                                 &coords,
                                 atlas_layer,
+                                order,
                             );
                         } else {
-                            self.batches.add_mask_rect_with_order(
+                            // Mask (subpixel) glyph. The mask atlas only
+                            // has one layer in practice → layer = 1.
+                            self.batches.add_text_mask_glyph(
                                 &glyph_rect,
                                 depth,
                                 &color,
                                 &coords,
-                                true,
+                                1,
                                 order,
                             );
                         }

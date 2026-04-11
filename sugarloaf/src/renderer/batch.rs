@@ -62,6 +62,80 @@ impl Vertex {
     }
 }
 
+/// Per-instance text glyph quad. Used by the instance-based text
+/// pipeline as a 1-to-1 replacement for the 6-vertex Vertex quads
+/// that the rect pipeline would otherwise emit for each text glyph.
+///
+/// Layout:
+///   * `pos`        — top-left of the glyph quad in physical pixels
+///   * `size`       — width and height of the glyph quad in physical pixels
+///   * `uv_min`     — atlas UV of the top-left corner (normalised 0..1)
+///   * `uv_max`     — atlas UV of the bottom-right corner
+///   * `color`      — RGBA tint applied to the sample (white for color glyphs,
+///                    actual text color for mask glyphs)
+///   * `layers`     — `[color_atlas_layer, mask_atlas_layer]`. Exactly one is
+///                    expected to be non-zero per instance: color glyphs use
+///                    `[N, 0]`, mask (subpixel) glyphs use `[0, N]`. The
+///                    fragment shader picks the right texture from this.
+///   * `clip_rect`  — `[x, y, w, h]` in physical pixels. `[0,0,0,0]` = no clip.
+///
+/// Total size: 8 + 8 + 8 + 8 + 16 + 8 + 16 = **72 bytes**.
+/// (Compare to 6 × 124 = 744 B per glyph quad in the old vertex pipeline —
+/// a ~10× reduction in per-frame upload bandwidth.)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+pub struct GlyphInstance {
+    pub pos: [f32; 2],
+    pub size: [f32; 2],
+    pub uv_min: [f32; 2],
+    pub uv_max: [f32; 2],
+    pub color: [f32; 4],
+    pub layers: [i32; 2],
+    pub clip_rect: [f32; 4],
+}
+
+impl GlyphInstance {
+    pub const SIZE: usize = std::mem::size_of::<Self>();
+}
+
+/// What pipeline a `DrawCommand` should be dispatched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawCommandKind {
+    /// Existing vertex-based rect pipeline. Slice from `DisplayList::vertices`.
+    Rect,
+    /// New per-instance text glyph pipeline. Slice from `DisplayList::glyph_instances`.
+    Glyph,
+}
+
+/// One range in a `DisplayList` to dispatch to one GPU pipeline.
+#[derive(Debug, Clone)]
+pub struct DrawCommand {
+    pub kind: DrawCommandKind,
+    pub range: std::ops::Range<u32>,
+    /// Color atlas layer for this batch (0 = none / not used).
+    pub color_layer: i32,
+    /// Mask atlas layer for this batch (0 = none / not used).
+    pub mask_layer: i32,
+}
+
+/// Output of `BatchManager::build_display_list`. Holds both rect
+/// vertex data and per-instance glyph data, plus an ordered list of
+/// `DrawCommand`s the renderer walks to dispatch each pipeline.
+#[derive(Default, Debug)]
+pub struct DisplayList {
+    pub vertices: Vec<Vertex>,
+    pub glyph_instances: Vec<GlyphInstance>,
+    pub commands: Vec<DrawCommand>,
+}
+
+impl DisplayList {
+    pub fn clear(&mut self) {
+        self.vertices.clear();
+        self.glyph_instances.clear();
+        self.commands.clear();
+    }
+}
+
 /// Rectangle with floating point coordinates.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct Rect {
@@ -89,13 +163,31 @@ impl From<[f32; 4]> for Rect {
     }
 }
 
+/// What kind of geometry a `Batch` holds. Determines which GPU pipeline
+/// it eventually gets dispatched to.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchKind {
+    /// Vertex-based pipeline. Used for backgrounds, borders, underlines,
+    /// drawable characters, lines, triangles, polygons, arcs, rounded
+    /// rects, kitty graphics, and overlay images.
+    #[default]
+    Rect,
+    /// Per-instance glyph pipeline. Used for text glyph quads added via
+    /// the new `add_text_color_glyph` / `add_text_mask_glyph` methods on
+    /// `BatchManager`. Holds `glyph_instances` instead of `vertices`.
+    Glyph,
+}
+
 #[derive(Default, Debug)]
 struct Batch {
     image: Option<i32>,
     mask: Option<i32>,
     vertices: Vec<Vertex>,
+    /// Per-instance glyph quads. Only populated when `kind == Glyph`.
+    glyph_instances: Vec<GlyphInstance>,
     subpix: bool,
     order: u8,
+    kind: BatchKind,
 }
 
 impl Batch {
@@ -103,8 +195,10 @@ impl Batch {
         self.image = None;
         self.mask = None;
         self.vertices.clear();
+        self.glyph_instances.clear();
         self.subpix = false;
         self.order = 0;
+        self.kind = BatchKind::Rect;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -662,10 +756,34 @@ impl Batch {
         self.vertices.push(v0);
     }
 
+    /// Try to append one glyph instance to this batch. Returns `true` if
+    /// it merged into this batch (matching kind, image, mask, order),
+    /// `false` if a fresh batch is needed.
     #[inline]
-    fn build_display_list(&self, list: &mut Vec<Vertex>) {
-        // Since vertices are already in draw order, we can just copy them
-        list.extend_from_slice(&self.vertices);
+    fn add_glyph(
+        &mut self,
+        instance: GlyphInstance,
+        image: Option<i32>,
+        mask: Option<i32>,
+    ) -> bool {
+        if self.kind != BatchKind::Glyph && !self.glyph_instances.is_empty() {
+            return false;
+        }
+        if self.kind == BatchKind::Rect && !self.vertices.is_empty() {
+            // Existing rect batch with content; can't repurpose.
+            return false;
+        }
+        if !self.glyph_instances.is_empty() && self.image != image {
+            return false;
+        }
+        if !self.glyph_instances.is_empty() && self.mask != mask {
+            return false;
+        }
+        self.kind = BatchKind::Glyph;
+        self.image = image;
+        self.mask = mask;
+        self.glyph_instances.push(instance);
+        true
     }
 }
 
@@ -901,35 +1019,6 @@ impl BatchManager {
         }
     }
 
-    pub fn add_mask_rect_with_order(
-        &mut self,
-        rect: &Rect,
-        depth: f32,
-        color: &[f32; 4],
-        coords: &[f32; 4],
-        subpix: bool,
-        order: u8,
-    ) {
-        let cr = self.clip_rect;
-        for batch in self.active.iter_mut() {
-            if batch.order == order
-                && batch.rect(rect, depth, color, Some(coords), None, Some(1), subpix, cr)
-            {
-                return;
-            }
-        }
-        self.alloc_batch(order).rect(
-            rect,
-            depth,
-            color,
-            Some(coords),
-            None,
-            Some(1),
-            subpix,
-            cr,
-        );
-    }
-
     #[inline]
     pub fn add_image_rect(
         &mut self,
@@ -966,6 +1055,84 @@ impl BatchManager {
             false,
             cr,
         );
+    }
+
+    /// Add a text glyph quad sampled from the **color** atlas.
+    ///
+    /// This is the per-instance equivalent of `add_image_rect` for text
+    /// (color emoji, color glyphs). The instance is appended to the
+    /// glyph instance buffer instead of expanding to 6 vertices in the
+    /// rect pipeline. ~10× less per-frame upload bandwidth than the
+    /// vertex path it replaces.
+    ///
+    /// `coords` is `[uv_min_x, uv_min_y, uv_max_x, uv_max_y]` in atlas
+    /// space, matching `add_image_rect`'s convention.
+    #[inline]
+    pub fn add_text_color_glyph(
+        &mut self,
+        rect: &Rect,
+        depth: f32,
+        color: &[f32; 4],
+        coords: &[f32; 4],
+        atlas_layer: i32,
+        order: u8,
+    ) {
+        let _ = depth; // depth field reserved for future depth-buffer use
+        let instance = GlyphInstance {
+            pos: [rect.x, rect.y],
+            size: [rect.width, rect.height],
+            uv_min: [coords[0], coords[1]],
+            uv_max: [coords[2], coords[3]],
+            color: *color,
+            layers: [atlas_layer, 0],
+            clip_rect: self.clip_rect,
+        };
+
+        let image = Some(atlas_layer);
+        let mask = None;
+        for batch in self.active.iter_mut() {
+            if batch.order == order && batch.add_glyph(instance, image, mask) {
+                return;
+            }
+        }
+        self.alloc_batch(order).add_glyph(instance, image, mask);
+    }
+
+    /// Add a text glyph quad sampled from the **mask** atlas.
+    ///
+    /// Mask glyphs are R8 alpha samples that get tinted by `color`
+    /// (subpixel-rendered text). `atlas_layer` is the mask atlas layer
+    /// index; the corresponding color layer is 0 because the texture is
+    /// the mask, not RGBA.
+    #[inline]
+    pub fn add_text_mask_glyph(
+        &mut self,
+        rect: &Rect,
+        depth: f32,
+        color: &[f32; 4],
+        coords: &[f32; 4],
+        atlas_layer: i32,
+        order: u8,
+    ) {
+        let _ = depth;
+        let instance = GlyphInstance {
+            pos: [rect.x, rect.y],
+            size: [rect.width, rect.height],
+            uv_min: [coords[0], coords[1]],
+            uv_max: [coords[2], coords[3]],
+            color: *color,
+            layers: [0, atlas_layer],
+            clip_rect: self.clip_rect,
+        };
+
+        let image = None;
+        let mask = Some(atlas_layer);
+        for batch in self.active.iter_mut() {
+            if batch.order == order && batch.add_glyph(instance, image, mask) {
+                return;
+            }
+        }
+        self.alloc_batch(order).add_glyph(instance, image, mask);
     }
 
     #[inline]
@@ -1110,18 +1277,54 @@ impl BatchManager {
         );
     }
 
-    #[inline]
-    pub fn build_display_list(&mut self, list: &mut Vec<Vertex>) {
-        // Sort batches by draw order (painter's algorithm)
-        // Secondary sort: unmasked batches (backgrounds) before masked batches (text)
-        // This ensures backgrounds render before text at the same draw order level
+    /// Build a structured display list containing both rect vertices
+    /// (for the existing rect/border/underline pipeline) **and** glyph
+    /// instances (for the per-instance text pipeline), interleaved in
+    /// painter's order via a list of `DrawCommand`s.
+    ///
+    /// The renderer walks `commands` in order and dispatches each one to
+    /// the appropriate GPU pipeline, using `range` to slice into either
+    /// `vertices` or `glyph_instances`. Cross-pipeline ordering is
+    /// preserved because batches are sorted by `(order, mask.is_some())`
+    /// before commands are emitted.
+    pub fn build_display_list(&mut self, list: &mut DisplayList) {
+        list.clear();
+        // Same sort key as the legacy path so painter ordering is
+        // identical between the old single-pipeline and new split paths.
         self.active.sort_by_key(|b| (b.order, b.mask.is_some()));
 
         for batch in &self.active {
-            if batch.vertices.is_empty() {
-                continue;
+            match batch.kind {
+                BatchKind::Rect => {
+                    if batch.vertices.is_empty() {
+                        continue;
+                    }
+                    let start = list.vertices.len() as u32;
+                    list.vertices.extend_from_slice(&batch.vertices);
+                    let end = list.vertices.len() as u32;
+                    list.commands.push(DrawCommand {
+                        kind: DrawCommandKind::Rect,
+                        range: start..end,
+                        color_layer: batch.image.unwrap_or(0),
+                        mask_layer: batch.mask.unwrap_or(0),
+                    });
+                }
+                BatchKind::Glyph => {
+                    if batch.glyph_instances.is_empty() {
+                        continue;
+                    }
+                    let start = list.glyph_instances.len() as u32;
+                    list.glyph_instances
+                        .extend_from_slice(&batch.glyph_instances);
+                    let end = list.glyph_instances.len() as u32;
+                    list.commands.push(DrawCommand {
+                        kind: DrawCommandKind::Glyph,
+                        range: start..end,
+                        color_layer: batch.image.unwrap_or(0),
+                        mask_layer: batch.mask.unwrap_or(0),
+                    });
+                }
             }
-            batch.build_display_list(list);
         }
     }
 

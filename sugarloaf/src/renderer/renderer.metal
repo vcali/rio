@@ -488,3 +488,93 @@ fragment float4 fs_main(
 
     return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
+
+// ===========================================================================
+// Per-instance text glyph pipeline.
+//
+// Mirrors `glyph.wgsl`. One instance per glyph quad. The vertex stage
+// synthesises the unit-quad corner from `vertex_id`, scales it into
+// screen space using the per-instance `pos` + `size`, and computes the
+// atlas UV from `uv_min` / `uv_max`. The fragment stage picks between
+// the color atlas (color glyphs) or the mask atlas (subpixel text)
+// based on which of `layers.x` / `layers.y` is non-zero.
+// ===========================================================================
+
+struct GlyphInstanceInput {
+    float2 pos        [[attribute(0)]];   // top-left in physical pixels
+    float2 size       [[attribute(1)]];   // width / height in physical pixels
+    float2 uv_min     [[attribute(2)]];   // atlas UV of top-left  (0..1)
+    float2 uv_max     [[attribute(3)]];   // atlas UV of bottom-right (0..1)
+    float4 color      [[attribute(4)]];   // RGBA tint
+    int2   layers     [[attribute(5)]];   // [color_layer, mask_layer]
+    float4 clip_rect  [[attribute(6)]];   // [x, y, w, h] px; [0,0,0,0] = none
+};
+
+struct GlyphVertexOut {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+    int    color_layer [[flat]];
+    int    mask_layer  [[flat]];
+    float4 clip_rect   [[flat]];
+    float2 screen_pos;
+};
+
+vertex GlyphVertexOut vs_glyph(
+    uint vid [[vertex_id]],
+    GlyphInstanceInput instance [[stage_in]],
+    constant Globals &globals [[buffer(1)]]
+) {
+    // Triangle strip: 4 vertices → quad
+    //   0 → 1
+    //   |  /|
+    //   2 → 3
+    float2 corner;
+    corner.x = float(vid == 1 || vid == 3);
+    corner.y = float(vid == 2 || vid == 3);
+
+    float2 screen_pos = instance.pos + instance.size * corner;
+    float2 uv = instance.uv_min + (instance.uv_max - instance.uv_min) * corner;
+
+    GlyphVertexOut out;
+    out.position = globals.transform * float4(screen_pos, 0.0, 1.0);
+    out.uv = uv;
+    out.color = instance.color;
+    out.color_layer = instance.layers.x;
+    out.mask_layer = instance.layers.y;
+    out.clip_rect = instance.clip_rect;
+    out.screen_pos = screen_pos;
+    return out;
+}
+
+fragment float4 fs_glyph(
+    GlyphVertexOut input [[stage_in]],
+    texture2d<float> color_texture [[texture(0)]],
+    texture2d<float> mask_texture  [[texture(1)]],
+    sampler glyph_sampler          [[sampler(0)]]
+) {
+    // Pixel-space clip-rect test. [0,0,0,0] = no clipping.
+    if (input.clip_rect.z > 0.0 && input.clip_rect.w > 0.0) {
+        float2 p = input.screen_pos;
+        if (p.x < input.clip_rect.x ||
+            p.y < input.clip_rect.y ||
+            p.x > input.clip_rect.x + input.clip_rect.z ||
+            p.y > input.clip_rect.y + input.clip_rect.w) {
+            discard_fragment();
+        }
+    }
+
+    if (input.mask_layer > 0) {
+        // Subpixel-rendered text: sample R8 alpha and tint by color.
+        float alpha = mask_texture.sample(glyph_sampler, input.uv).r;
+        return float4(input.color.rgb, input.color.a * alpha);
+    }
+
+    if (input.color_layer > 0) {
+        // Color glyph (e.g. emoji): sample full RGBA, modulate by color.
+        float4 sample = color_texture.sample(glyph_sampler, input.uv);
+        return sample * input.color;
+    }
+
+    return float4(0.0);
+}

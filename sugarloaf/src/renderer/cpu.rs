@@ -293,8 +293,10 @@ pub fn render_cpu(
     background: Option<wgpu::Color>,
 ) {
     let vertices = renderer.vertices();
+    let glyph_instances = &renderer.display_list().glyph_instances;
 
-    // Frame skip.
+    // Frame skip — hash both vertex and glyph-instance data so we
+    // detect a frame change in either stream.
     let frame_hash = {
         let mut h = rustc_hash::FxHasher::default();
         if let Some(c) = background {
@@ -305,8 +307,10 @@ pub fn render_cpu(
         } else {
             h.write_u8(0);
         }
-        let bytes: &[u8] = bytemuck::cast_slice(vertices);
-        h.write(bytes);
+        let vbytes: &[u8] = bytemuck::cast_slice(vertices);
+        h.write(vbytes);
+        let gbytes: &[u8] = bytemuck::cast_slice(glyph_instances.as_slice());
+        h.write(gbytes);
         h.finish()
     };
 
@@ -417,6 +421,68 @@ pub fn render_cpu(
 
         if let Some(p) = pending.take() {
             flush_fill(buf_slice, buf_w, &p);
+        }
+    }
+
+    // Walk per-instance glyph quads. After the per-instance text
+    // pipeline rewrite, glyph quads no longer expand into 6 vertices —
+    // they live in `display_list.glyph_instances` and the GPU paths
+    // dispatch them via instanced draws. The CPU rasterizer mirrors
+    // that here by walking instances and calling `draw_glyph` per
+    // mask glyph (color glyphs / emoji are still not implemented in
+    // the CPU path).
+    if !glyph_instances.is_empty() {
+        let images = renderer.image_cache();
+        let atlas_size = images.cpu_max_texture_size();
+        let buf_slice: &mut [u32] = &mut buffer;
+
+        for instance in glyph_instances {
+            // CPU rasterizer only supports the mask path. Color glyphs
+            // (emoji) are skipped, matching the legacy behaviour.
+            if instance.layers[1] <= 0 {
+                continue;
+            }
+
+            // Build a ParsedQuad-equivalent screen rect + atlas UV.
+            let q = ParsedQuad {
+                min_x: instance.pos[0],
+                min_y: instance.pos[1],
+                max_x: instance.pos[0] + instance.size[0],
+                max_y: instance.pos[1] + instance.size[1],
+                min_u: instance.uv_min[0],
+                min_v: instance.uv_min[1],
+                color: instance.color,
+                color_layer: instance.layers[0],
+                mask_layer: instance.layers[1],
+                clip: instance.clip_rect,
+            };
+
+            if q.max_x - q.min_x <= 0.0 || q.max_y - q.min_y <= 0.0 {
+                continue;
+            }
+
+            let snapped = match snap_and_clip(&q, buf_w, buf_h) {
+                Some(r) => r,
+                None => continue,
+            };
+            let (x0, y0, x1, y1) = snapped;
+
+            draw_glyph(
+                buf_slice,
+                buf_w,
+                x0,
+                y0,
+                x1,
+                y1,
+                q.min_x,
+                q.min_y,
+                q.min_u,
+                q.min_v,
+                q.color,
+                images,
+                atlas_size,
+                cache,
+            );
         }
     }
 

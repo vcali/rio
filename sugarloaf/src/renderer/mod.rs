@@ -68,6 +68,24 @@ pub struct WgpuRenderer {
     /// kept separate from the kitty `image_vertex_buffer` so it cannot
     /// collide with kitty placement slots.
     background_image_vertex_buffer: wgpu::Buffer,
+
+    // --- Per-instance text glyph pipeline (stage 1 of the Vertex
+    //     repack). When `batch::USE_INSTANCE_GLYPH_PIPELINE` is enabled,
+    //     compositor.rs routes glyph quads through these instead of
+    //     emitting 6 vertices per quad to `pipeline`.
+    /// Pipeline that consumes a `GlyphInstance` buffer and a quad-corner
+    /// vertex_index. Reuses `constant_bind_group` (transform + sampler).
+    glyph_pipeline: wgpu::RenderPipeline,
+    /// Bind group layout for the glyph pipeline's atlas textures
+    /// (color + mask). Same shape as `layout_bind_group_layout` so
+    /// `update_bind_group` can be reused.
+    glyph_layout_bind_group_layout: wgpu::BindGroupLayout,
+    /// Current glyph atlas bind group (color + mask views).
+    glyph_layout_bind_group: wgpu::BindGroup,
+    /// Storage for `GlyphInstance` data uploaded each frame.
+    glyph_instance_buffer: wgpu::Buffer,
+    /// Capacity in number of instances of `glyph_instance_buffer`.
+    supported_glyph_instances: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -93,6 +111,14 @@ pub struct MetalRenderer {
     /// kept separate from the kitty `image_vertex_buffer` so it cannot
     /// collide with kitty placement slots.
     background_image_vertex_buffer: Buffer,
+
+    // --- Per-instance text glyph pipeline (stage 1 of the Vertex
+    //     repack), Metal port. When `batch::USE_INSTANCE_GLYPH_PIPELINE`
+    //     is enabled, glyph quads are dispatched through this pipeline
+    //     instead of expanding to 6 vertices in `pipeline_state`.
+    glyph_pipeline_state: RenderPipelineState,
+    glyph_instance_buffer: Buffer,
+    supported_glyph_instances: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -376,6 +402,131 @@ impl MetalRenderer {
         background_image_vertex_buffer
             .set_label("sugarloaf::background image instance buffer");
 
+        // -----------------------------------------------------------------
+        // Per-instance text glyph pipeline (stage 1).
+        //
+        // Reuses the existing `library` (built from `renderer.metal`) for
+        // its `vs_glyph` / `fs_glyph` entry points. The vertex descriptor
+        // matches the `GlyphInstance` field layout exactly and uses
+        // `PerInstance` step function so the vertex shader runs once per
+        // glyph quad with `vertex_id ∈ {0,1,2,3}` synthesising the four
+        // tristrip corners.
+        // -----------------------------------------------------------------
+        let glyph_vertex_fn = library
+            .get_function("vs_glyph", None)
+            .expect("Failed to get glyph vertex function");
+        let glyph_fragment_fn = library
+            .get_function("fs_glyph", None)
+            .expect("Failed to get glyph fragment function");
+
+        let glyph_vertex_descriptor = VertexDescriptor::new();
+        let glyph_attrs = glyph_vertex_descriptor.attributes();
+
+        // GlyphInstance layout (72 bytes total):
+        //   pos:       float2  @ offset 0   (8 bytes)
+        //   size:      float2  @ offset 8   (8 bytes)
+        //   uv_min:    float2  @ offset 16  (8 bytes)
+        //   uv_max:    float2  @ offset 24  (8 bytes)
+        //   color:     float4  @ offset 32  (16 bytes)
+        //   layers:    int2    @ offset 48  (8 bytes)
+        //   clip_rect: float4  @ offset 56  (16 bytes)
+
+        glyph_attrs
+            .object_at(0)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float2);
+        glyph_attrs.object_at(0).unwrap().set_offset(0);
+        glyph_attrs.object_at(0).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(1)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float2);
+        glyph_attrs.object_at(1).unwrap().set_offset(8);
+        glyph_attrs.object_at(1).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(2)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float2);
+        glyph_attrs.object_at(2).unwrap().set_offset(16);
+        glyph_attrs.object_at(2).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(3)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float2);
+        glyph_attrs.object_at(3).unwrap().set_offset(24);
+        glyph_attrs.object_at(3).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(4)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float4);
+        glyph_attrs.object_at(4).unwrap().set_offset(32);
+        glyph_attrs.object_at(4).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(5)
+            .unwrap()
+            .set_format(MTLVertexFormat::Int2);
+        glyph_attrs.object_at(5).unwrap().set_offset(48);
+        glyph_attrs.object_at(5).unwrap().set_buffer_index(0);
+
+        glyph_attrs
+            .object_at(6)
+            .unwrap()
+            .set_format(MTLVertexFormat::Float4);
+        glyph_attrs.object_at(6).unwrap().set_offset(56);
+        glyph_attrs.object_at(6).unwrap().set_buffer_index(0);
+
+        let glyph_layouts = glyph_vertex_descriptor.layouts();
+        glyph_layouts
+            .object_at(0)
+            .unwrap()
+            .set_stride(mem::size_of::<crate::renderer::batch::GlyphInstance>() as u64);
+        glyph_layouts
+            .object_at(0)
+            .unwrap()
+            .set_step_function(MTLVertexStepFunction::PerInstance);
+        glyph_layouts.object_at(0).unwrap().set_step_rate(1);
+
+        let glyph_pipeline_descriptor = RenderPipelineDescriptor::new();
+        glyph_pipeline_descriptor.set_vertex_function(Some(&glyph_vertex_fn));
+        glyph_pipeline_descriptor.set_fragment_function(Some(&glyph_fragment_fn));
+        glyph_pipeline_descriptor.set_vertex_descriptor(Some(glyph_vertex_descriptor));
+
+        // Same blend mode as the existing rect/text pipeline so glyphs
+        // composite identically.
+        let glyph_color_attachment = glyph_pipeline_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        glyph_color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        glyph_color_attachment.set_blending_enabled(true);
+        glyph_color_attachment
+            .set_source_rgb_blend_factor(MTLBlendFactor::SourceAlpha);
+        glyph_color_attachment
+            .set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+        glyph_color_attachment.set_rgb_blend_operation(MTLBlendOperation::Add);
+        glyph_color_attachment.set_source_alpha_blend_factor(MTLBlendFactor::One);
+        glyph_color_attachment
+            .set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+        glyph_color_attachment.set_alpha_blend_operation(MTLBlendOperation::Add);
+
+        let glyph_pipeline_state = context
+            .device
+            .new_render_pipeline_state(&glyph_pipeline_descriptor)
+            .expect("Failed to create glyph pipeline state");
+
+        let supported_glyph_instances = 4096_usize;
+        let glyph_instance_buffer = context.device.new_buffer(
+            (mem::size_of::<crate::renderer::batch::GlyphInstance>()
+                * supported_glyph_instances) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        glyph_instance_buffer.set_label("sugarloaf::glyph instance buffer");
+
         Self {
             pipeline_state,
             vertex_buffer,
@@ -386,6 +537,9 @@ impl MetalRenderer {
             image_pipeline_state,
             image_vertex_buffer,
             background_image_vertex_buffer,
+            glyph_pipeline_state,
+            glyph_instance_buffer,
+            supported_glyph_instances,
         }
     }
 
@@ -400,40 +554,71 @@ impl MetalRenderer {
         }
     }
 
+    /// Walk `display_list.commands` in painter order, dispatching each
+    /// one to the rect or glyph pipeline. The rect pipeline uses the
+    /// `pipeline_state` / `vertex_buffer`; the glyph pipeline uses the
+    /// `glyph_pipeline_state` / `glyph_instance_buffer`. Pipeline
+    /// switches are cheap on Metal and we minimise them by tracking
+    /// `current_kind`.
     pub fn render(
         &mut self,
-        vertices: &[Vertex],
+        display_list: &crate::renderer::batch::DisplayList,
         images: &ImageCache,
         render_encoder: &RenderCommandEncoderRef,
         context: &MetalContext,
     ) {
-        if vertices.is_empty() {
+        if display_list.commands.is_empty() {
             return;
         }
 
-        // Expand vertex buffer if needed
-        if vertices.len() > self.supported_vertex_buffer {
-            self.supported_vertex_buffer = (vertices.len() as f32 * 1.25) as usize;
-
-            // Recreate vertex buffer with larger size
-            self.vertex_buffer = context.device.new_buffer(
-                (mem::size_of::<Vertex>() * self.supported_vertex_buffer) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            self.vertex_buffer
-                .set_label("sugarloaf::rich_text vertex buffer (resized)");
+        // -- Upload rect vertices into the existing vertex_buffer.
+        if !display_list.vertices.is_empty() {
+            if display_list.vertices.len() > self.supported_vertex_buffer {
+                self.supported_vertex_buffer =
+                    (display_list.vertices.len() as f32 * 1.25) as usize;
+                self.vertex_buffer = context.device.new_buffer(
+                    (mem::size_of::<Vertex>() * self.supported_vertex_buffer) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                self.vertex_buffer
+                    .set_label("sugarloaf::rich_text vertex buffer (resized)");
+            }
+            let vertex_data = self.vertex_buffer.contents() as *mut Vertex;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    display_list.vertices.as_ptr(),
+                    vertex_data,
+                    display_list.vertices.len(),
+                );
+            }
         }
 
-        // Copy vertex data to buffer
-        let vertex_data = self.vertex_buffer.contents() as *mut Vertex;
-        unsafe {
-            std::ptr::copy_nonoverlapping(vertices.as_ptr(), vertex_data, vertices.len());
+        // -- Upload glyph instances into the glyph_instance_buffer.
+        if !display_list.glyph_instances.is_empty() {
+            if display_list.glyph_instances.len() > self.supported_glyph_instances {
+                self.supported_glyph_instances =
+                    (display_list.glyph_instances.len() as f32 * 1.25) as usize;
+                self.glyph_instance_buffer = context.device.new_buffer(
+                    (mem::size_of::<crate::renderer::batch::GlyphInstance>()
+                        * self.supported_glyph_instances)
+                        as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                self.glyph_instance_buffer
+                    .set_label("sugarloaf::glyph instance buffer (resized)");
+            }
+            let glyph_data = self.glyph_instance_buffer.contents()
+                as *mut crate::renderer::batch::GlyphInstance;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    display_list.glyph_instances.as_ptr(),
+                    glyph_data,
+                    display_list.glyph_instances.len(),
+                );
+            }
         }
 
-        // Set up render state
-        render_encoder.set_render_pipeline_state(&self.pipeline_state);
-        render_encoder.set_vertex_buffer(0, Some(&self.vertex_buffer), 0);
-
+        // -- Update transform if window resized since last frame.
         let transform = orthographic_projection(context.size.width, context.size.height);
         if self.current_transform != transform {
             let globals = Globals { transform };
@@ -444,38 +629,49 @@ impl MetalRenderer {
             self.current_transform = transform;
         }
 
-        render_encoder.set_vertex_buffer(1, Some(&self.uniform_buffer), 0);
-
-        // Set sampler
-        render_encoder.set_fragment_sampler_state(0, Some(&self.sampler));
-
-        // Implement proper batching by atlas to avoid lifetime issues
         let color_textures = images.get_metal_textures();
         let mask_texture = images.get_mask_texture();
 
-        // Group vertices by their texture binding requirements
-        // layers[0] = color_layer (0 = no color texture, 1+ = color atlas index)
-        // layers[1] = mask_layer (0 = no mask texture, 1 = mask atlas)
+        // Track which pipeline is currently bound so we don't redundantly
+        // re-bind state across consecutive same-kind commands. Pipeline
+        // switches are cheap on Metal but cheaper still when avoided.
+        let mut current_kind: Option<crate::renderer::batch::DrawCommandKind> = None;
 
-        let mut current_vertex = 0usize;
-        while current_vertex < vertices.len() {
-            let start = current_vertex;
-            let current_color_layer = vertices[start].layers[0];
-            let current_mask_layer = vertices[start].layers[1];
-
-            // Find the end of this batch (consecutive vertices with same layers)
-            let mut end = start;
-            while end < vertices.len()
-                && vertices[end].layers[0] == current_color_layer
-                && vertices[end].layers[1] == current_mask_layer
-            {
-                end += 1;
+        for cmd in &display_list.commands {
+            // Bind / rebind pipeline + per-pipeline buffers when the
+            // kind changes.
+            if current_kind != Some(cmd.kind) {
+                match cmd.kind {
+                    crate::renderer::batch::DrawCommandKind::Rect => {
+                        render_encoder.set_render_pipeline_state(&self.pipeline_state);
+                        render_encoder
+                            .set_vertex_buffer(0, Some(&self.vertex_buffer), 0);
+                        render_encoder
+                            .set_vertex_buffer(1, Some(&self.uniform_buffer), 0);
+                        render_encoder
+                            .set_fragment_sampler_state(0, Some(&self.sampler));
+                    }
+                    crate::renderer::batch::DrawCommandKind::Glyph => {
+                        render_encoder
+                            .set_render_pipeline_state(&self.glyph_pipeline_state);
+                        render_encoder.set_vertex_buffer(
+                            0,
+                            Some(&self.glyph_instance_buffer),
+                            0,
+                        );
+                        render_encoder
+                            .set_vertex_buffer(1, Some(&self.uniform_buffer), 0);
+                        render_encoder
+                            .set_fragment_sampler_state(0, Some(&self.sampler));
+                    }
+                }
+                current_kind = Some(cmd.kind);
             }
 
-            // Bind appropriate textures for this batch
-            if current_color_layer > 0 {
-                // Use color atlas (current_color_layer is 1-based, so subtract 1 for 0-based index)
-                let atlas_index = (current_color_layer - 1) as usize;
+            // Bind atlases for this command. Each command carries its
+            // own (color_layer, mask_layer) so we always rebind.
+            if cmd.color_layer > 0 {
+                let atlas_index = (cmd.color_layer - 1) as usize;
                 if atlas_index < color_textures.len() {
                     render_encoder
                         .set_fragment_texture(0, Some(color_textures[atlas_index]));
@@ -486,7 +682,7 @@ impl MetalRenderer {
                 render_encoder.set_fragment_texture(0, None);
             }
 
-            if current_mask_layer > 0 {
+            if cmd.mask_layer > 0 {
                 if let Some(mask_tex) = mask_texture {
                     render_encoder.set_fragment_texture(1, Some(mask_tex));
                 } else {
@@ -496,14 +692,29 @@ impl MetalRenderer {
                 render_encoder.set_fragment_texture(1, None);
             }
 
-            // Draw this batch
-            render_encoder.draw_primitives(
-                MTLPrimitiveType::Triangle,
-                start as u64,
-                (end - start) as u64,
-            );
-
-            current_vertex = end;
+            match cmd.kind {
+                crate::renderer::batch::DrawCommandKind::Rect => {
+                    render_encoder.draw_primitives(
+                        MTLPrimitiveType::Triangle,
+                        cmd.range.start as u64,
+                        (cmd.range.end - cmd.range.start) as u64,
+                    );
+                }
+                crate::renderer::batch::DrawCommandKind::Glyph => {
+                    // 4-vertex tristrip × N instances. Metal's instanced
+                    // draw call: vertices 0..4, instance_count = range.len.
+                    let instance_count =
+                        (cmd.range.end - cmd.range.start) as u64;
+                    let base_instance = cmd.range.start as u64;
+                    render_encoder.draw_primitives_instanced_base_instance(
+                        MTLPrimitiveType::TriangleStrip,
+                        0,
+                        4,
+                        instance_count,
+                        base_instance,
+                    );
+                }
+            }
         }
     }
 }
@@ -575,7 +786,10 @@ pub struct BackgroundImagePixels {
 pub struct Renderer {
     brush_type: RendererType,
     comp: Compositor,
-    vertices: Vec<Vertex>,
+    /// Structured display list output from `BatchManager::build_display_list`.
+    /// Holds rect vertices, per-instance glyph quads, and an ordered
+    /// list of `DrawCommand`s the renderer dispatches in painter order.
+    display_list: crate::renderer::batch::DisplayList,
     images: ImageCache,
     glyphs: GlyphCache,
     text_run_manager: TextRunManager,
@@ -695,7 +909,7 @@ impl Renderer {
         Self {
             brush_type,
             comp: Compositor::new(),
-            vertices: vec![],
+            display_list: Default::default(),
             images: ImageCache::new(context),
             glyphs: GlyphCache::new(),
             text_run_manager: TextRunManager::new(),
@@ -731,8 +945,8 @@ impl Renderer {
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
     ) {
-        // Always clear vertices first
-        self.vertices.clear();
+        // Always clear the display list first.
+        self.display_list.clear();
 
         let library = state.content.font_library();
         // Iterate over all content states and render visible ones
@@ -959,9 +1173,14 @@ impl Renderer {
                 upload_background_image_texture(context, &pixels);
         }
 
-        self.vertices.clear();
+        self.display_list.clear();
         self.images.process_atlases(context);
-        self.comp.finish(&mut self.vertices);
+        // Produce a structured display list. Glyph quads land in
+        // `display_list.glyph_instances`; everything else (backgrounds,
+        // borders, underlines, drawable chars, overlays) lands in
+        // `display_list.vertices`. Commands preserve painter order
+        // across both.
+        self.comp.finish(&mut self.display_list);
     }
 
     #[inline]
@@ -2045,7 +2264,7 @@ impl Renderer {
         let Self {
             brush_type,
             images,
-            vertices,
+            display_list,
             image_draws,
             image_textures,
             background_image_texture,
@@ -2059,7 +2278,8 @@ impl Renderer {
 
             let has_images = !image_draws.is_empty();
             let has_background = background_image_texture.is_some();
-            if (color_views.is_empty() || vertices.is_empty())
+            let has_anything_to_draw = !display_list.commands.is_empty();
+            if (color_views.is_empty() || !has_anything_to_draw)
                 && !has_images
                 && !has_background
             {
@@ -2165,42 +2385,46 @@ impl Renderer {
                 rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
             }
 
-            // Text pipeline: batching by atlas
-            let mut current_vertex = 0usize;
-            while current_vertex < vertices.len() {
-                let start = current_vertex;
-                let current_color_layer = vertices[start].layers[0];
-                let current_mask_layer = vertices[start].layers[1];
-
-                // Find the end of this batch (consecutive vertices with same layers)
-                let mut end = start;
-                while end < vertices.len()
-                    && vertices[end].layers[0] == current_color_layer
-                    && vertices[end].layers[1] == current_mask_layer
-                {
-                    end += 1;
-                }
-
-                // Bind appropriate textures for this batch
-                let color_view = if current_color_layer > 0 {
-                    let atlas_index = (current_color_layer - 1) as usize;
+            // Walk the structured display list in painter order,
+            // dispatching each command to either the rect or the glyph
+            // pipeline. Pipeline switches are cheap on modern GPUs.
+            for cmd in &display_list.commands {
+                let color_view = if cmd.color_layer > 0 {
+                    let atlas_index = (cmd.color_layer - 1) as usize;
                     color_views.get(atlas_index).unwrap_or(&color_views[0])
                 } else {
                     &color_views[0]
                 };
-
-                let final_mask_view = if current_mask_layer > 0 {
+                let final_mask_view = if cmd.mask_layer > 0 {
                     mask_texture_view.unwrap_or(color_views[0])
                 } else {
                     color_views[0]
                 };
 
-                brush.update_bind_group(ctx, color_view, final_mask_view);
-
-                // Draw this batch
-                brush.render_range(ctx, vertices, rpass, start..end);
-
-                current_vertex = end;
+                match cmd.kind {
+                    crate::renderer::batch::DrawCommandKind::Rect => {
+                        brush.update_bind_group(ctx, color_view, final_mask_view);
+                        brush.render_range(
+                            ctx,
+                            &display_list.vertices,
+                            rpass,
+                            cmd.range.start as usize..cmd.range.end as usize,
+                        );
+                    }
+                    crate::renderer::batch::DrawCommandKind::Glyph => {
+                        brush.update_glyph_bind_group(
+                            ctx,
+                            color_view,
+                            final_mask_view,
+                        );
+                        brush.render_glyph_range(
+                            ctx,
+                            &display_list.glyph_instances,
+                            rpass,
+                            cmd.range.start..cmd.range.end,
+                        );
+                    }
+                }
             }
 
             if has_images && image_draws.iter().any(|d| d.layer == ImageLayer::AboveText)
@@ -2280,8 +2504,15 @@ impl Renderer {
                 );
             }
 
-            // Text pipeline
-            brush.render(&self.vertices, &self.images, render_encoder, context);
+            // Walk the structured display list in painter order and
+            // dispatch each command to either the rect or the glyph
+            // Metal pipeline.
+            brush.render(
+                &self.display_list,
+                &self.images,
+                render_encoder,
+                context,
+            );
 
             // AboveText images (z >= 0): after text
             if has_images {
@@ -2298,7 +2529,15 @@ impl Renderer {
 
     /// Vertices accumulated for the current frame (CPU rasterizer reads these).
     pub(crate) fn vertices(&self) -> &[Vertex] {
-        &self.vertices
+        &self.display_list.vertices
+    }
+
+    /// Per-frame display list including glyph instances. The CPU
+    /// rasterizer walks this in addition to `vertices()` to handle text
+    /// glyphs (which live in `glyph_instances` after the per-instance
+    /// pipeline rewrite).
+    pub(crate) fn display_list(&self) -> &crate::renderer::batch::DisplayList {
+        &self.display_list
     }
 
     /// Image cache for CPU rasterizer atlas sampling.
@@ -2713,6 +2952,196 @@ impl WgpuRenderer {
                 mapped_at_creation: false,
             });
 
+        // -----------------------------------------------------------------
+        // Per-instance text glyph pipeline (stage 1).
+        //
+        // The shader is in `glyph.wgsl`. It uses the same bind group 0
+        // (transform + sampler) as the rect pipeline, and a bind group 1
+        // matching `layout_bind_group_layout` (color + mask atlas
+        // textures). The vertex stage reads `GlyphInstance` from a
+        // vertex buffer with `VertexStepMode::Instance` and synthesises
+        // the four quad corners from `vertex_index`.
+        // -----------------------------------------------------------------
+
+        let glyph_shader_source = include_str!("glyph.wgsl");
+        let glyph_shader =
+            context
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("glyph shader"),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(glyph_shader_source)),
+                });
+
+        // Reuse the layout shape from the existing rect pipeline so the
+        // same color+mask atlas bind group can be reused. We allocate a
+        // separate `BindGroupLayout` value because wgpu compares
+        // pipeline layouts structurally, not by identity, and there's
+        // no clean way to share it across two pipeline layouts that
+        // both need the constant_bind_group at slot 0.
+        let glyph_layout_bind_group_layout = context.device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("glyph atlas bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float {
+                                filterable: true,
+                            },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float {
+                                filterable: true,
+                            },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            },
+        );
+
+        let glyph_pipeline_layout =
+            context
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("glyph pipeline layout"),
+                    bind_group_layouts: &[
+                        &constant_bind_group_layout, // group 0: transform + sampler
+                        &glyph_layout_bind_group_layout, // group 1: atlases
+                    ],
+                    immediate_size: 0,
+                });
+
+        let glyph_pipeline =
+            context
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    cache: None,
+                    label: Some("glyph pipeline"),
+                    layout: Some(&glyph_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        compilation_options:
+                            wgpu::PipelineCompilationOptions::default(),
+                        module: &glyph_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: mem::size_of::<crate::renderer::batch::GlyphInstance>(
+                            )
+                                as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array!(
+                                0 => Float32x2, // pos
+                                1 => Float32x2, // size
+                                2 => Float32x2, // uv_min
+                                3 => Float32x2, // uv_max
+                                4 => Float32x4, // color
+                                5 => Sint32x2,  // layers
+                                6 => Float32x4, // clip_rect
+                            ),
+                        }],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        compilation_options:
+                            wgpu::PipelineCompilationOptions::default(),
+                        module: &glyph_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: context.format,
+                            blend: BLEND,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                });
+
+        // Initial bind group with placeholder textures. The renderer
+        // rebinds it every frame via `update_glyph_bind_group` with
+        // real atlas views.
+        let glyph_color_placeholder = context
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("glyph_placeholder_color"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let glyph_mask_placeholder = context
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("glyph_placeholder_mask"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let glyph_layout_bind_group =
+            context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("glyph atlas bind group (initial)"),
+                layout: &glyph_layout_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &glyph_color_placeholder,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &glyph_mask_placeholder,
+                        ),
+                    },
+                ],
+            });
+
+        let supported_glyph_instances = 4096_usize;
+        let glyph_instance_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glyph instance buffer"),
+            size: (mem::size_of::<crate::renderer::batch::GlyphInstance>()
+                * supported_glyph_instances) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         WgpuRenderer {
             layout_bind_group,
             layout_bind_group_layout,
@@ -2726,6 +3155,11 @@ impl WgpuRenderer {
             image_bind_group_layout,
             image_vertex_buffer,
             background_image_vertex_buffer,
+            glyph_pipeline,
+            glyph_layout_bind_group_layout,
+            glyph_layout_bind_group,
+            glyph_instance_buffer,
+            supported_glyph_instances,
         }
     }
 
@@ -2838,6 +3272,76 @@ impl WgpuRenderer {
                 ],
                 label: Some("rich_text::Pipeline uniforms"),
             });
+    }
+
+    /// Rebind the glyph pipeline's atlas textures. Called per draw
+    /// command in the new instance path, since each glyph batch can
+    /// reference different atlas layers.
+    pub fn update_glyph_bind_group(
+        &mut self,
+        ctx: &WgpuContext,
+        color_view: &wgpu::TextureView,
+        mask_view: &wgpu::TextureView,
+    ) {
+        self.glyph_layout_bind_group =
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.glyph_layout_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(color_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(mask_view),
+                    },
+                ],
+                label: Some("glyph::layout_bind_group"),
+            });
+    }
+
+    /// Upload `instances` into the glyph instance buffer (resizing if
+    /// needed) and dispatch one instanced draw covering `range`.
+    /// Caller is responsible for binding the right atlas via
+    /// `update_glyph_bind_group` first.
+    pub fn render_glyph_range(
+        &mut self,
+        ctx: &mut WgpuContext,
+        instances: &[crate::renderer::batch::GlyphInstance],
+        rpass: &mut wgpu::RenderPass,
+        range: std::ops::Range<u32>,
+    ) {
+        if range.is_empty() || instances.is_empty() {
+            return;
+        }
+
+        let stride = mem::size_of::<crate::renderer::batch::GlyphInstance>();
+        let needed_bytes = instances.len() * stride;
+
+        if instances.len() > self.supported_glyph_instances {
+            self.glyph_instance_buffer.destroy();
+            self.supported_glyph_instances =
+                (instances.len() as f32 * 1.25) as usize;
+            self.glyph_instance_buffer =
+                ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("glyph instance buffer"),
+                    size: (stride * self.supported_glyph_instances) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+        }
+
+        let bytes: &[u8] =
+            bytemuck::cast_slice(&instances[..instances.len().min(needed_bytes)]);
+        ctx.queue.write_buffer(&self.glyph_instance_buffer, 0, bytes);
+
+        rpass.set_pipeline(&self.glyph_pipeline);
+        rpass.set_bind_group(0, &self.constant_bind_group, &[]);
+        rpass.set_bind_group(1, &self.glyph_layout_bind_group, &[]);
+        rpass.set_vertex_buffer(0, self.glyph_instance_buffer.slice(..));
+
+        // 4 vertices per quad (triangle strip), N instances in `range`.
+        rpass.draw(0..4, range);
     }
 }
 
