@@ -1541,6 +1541,7 @@ Possible options:
 
 - `TITLE`: terminal title via OSC sequences for setting terminal title
 - `PROGRAM`: (e.g `fish`, `zsh`, `bash`, `vim`, etc...)
+- `PROGRAM_ICON`: icon derived from the foreground process name (currently `nvim`, shells, `git`/`lazygit`, `node`, `python`, `docker`, `rust`, and `terraform`)
 - `ABSOLUTE_PATH`: (e.g `/Users/rapha/Documents/a/rio`)
 - `RELATIVE_PATH`: home-relative path, shortened when deep (e.g `~/Documents/a/rio` or `…/a/psone/starpsx`)
 - `COLUMNS`: current columns
@@ -1576,6 +1577,15 @@ content = "{{ TITLE || RELATIVE_PATH }}"
 In this case, `TITLE` is non-existent so will use `RELATIVE_PATH`.
 
 Result: `~/Documents/a/rio`
+
+#### Example 4:
+
+```toml
+[title]
+content = "{{ PROGRAM_ICON }} {{ TITLE || PROGRAM }}"
+```
+
+For example, `nvim` renders with a Neovim icon, shells share a terminal icon, and tools like `git`, `node`, `python`, `docker`, `rust`, and `terraform` render with their own icons.
 
 ## title.placeholder
 

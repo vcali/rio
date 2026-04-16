@@ -221,6 +221,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.needs_render_after_occlusion = false;
                     }
 
+                    let _ = route.window.screen.context_manager.refresh_titles();
                     route.request_redraw();
                 }
             }
@@ -246,6 +247,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         if route.window.needs_render_after_occlusion {
                             route.window.needs_render_after_occlusion = false;
                         }
+
+                        let _ = route.window.screen.context_manager.refresh_titles();
 
                         // Mark the renderable content as needing to render
                         if let Some(ctx_item) =

@@ -413,7 +413,9 @@ impl Router<'_> {
     pub fn update_titles(&mut self) {
         for route in self.routes.values_mut() {
             if route.window.is_focused {
-                route.window.screen.context_manager.update_titles();
+                if route.window.screen.context_manager.update_titles() {
+                    route.request_redraw();
+                }
             }
         }
     }

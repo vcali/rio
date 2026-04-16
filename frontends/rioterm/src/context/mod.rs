@@ -719,7 +719,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    pub fn update_titles(&mut self) {
+    pub fn refresh_titles(&mut self) -> bool {
+        let previous_key = self.titles.key.clone();
+        self.titles.last_title_update = Some(Instant::now());
+        let mut id = String::default();
+        for (i, context) in self.contexts.iter_mut().enumerate() {
+            let content = update_title(&self.config.title.content, context.current());
+
+            self.event_proxy
+                .send_event(RioEvent::Title(content.to_owned()), self.window_id);
+
+            id.push_str(&format!("{i}{content};"));
+
+            if self.config.should_update_title_extra {
+                self.titles.set_key_val(
+                    i,
+                    content,
+                    create_title_extra_from_context(context.current()),
+                );
+            } else {
+                self.titles.set_key_val(i, content, None);
+            }
+        }
+
+        self.titles.set_key(id);
+        self.titles.key != previous_key
+    }
+
+    pub fn update_titles(&mut self) -> bool {
         let interval_time = Duration::from_secs(2);
         if self
             .titles
@@ -727,29 +754,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .map(|i| i.elapsed() > interval_time)
             .unwrap_or(true)
         {
-            self.titles.last_title_update = Some(Instant::now());
-            let mut id = String::default();
-            for (i, context) in self.contexts.iter_mut().enumerate() {
-                let content = update_title(&self.config.title.content, context.current());
-
-                self.event_proxy
-                    .send_event(RioEvent::Title(content.to_owned()), self.window_id);
-
-                id.push_str(&format!("{i}{content};"));
-
-                if self.config.should_update_title_extra {
-                    self.titles.set_key_val(
-                        i,
-                        content,
-                        create_title_extra_from_context(context.current()),
-                    );
-                } else {
-                    self.titles.set_key_val(i, content, None);
-                }
-            }
-
-            self.titles.set_key(id);
+            return self.refresh_titles();
         }
+
+        false
     }
 
     #[inline]
@@ -1118,6 +1126,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                         self.current_index = last_index;
                         self.current_route = self.current().route_id;
                     }
+
+                    let _ = self.refresh_titles();
                 }
                 Err(..) => {
                     tracing::error!("not able to create a new context");
@@ -1219,11 +1229,13 @@ pub mod test {
         context_manager.add_context(should_redirect, 0);
         assert_eq!(context_manager.capacity, 5);
         assert_eq!(context_manager.current_index, 0);
+        assert!(context_manager.titles.titles.contains_key(&1));
 
         let should_redirect = true;
         context_manager.add_context(should_redirect, 0);
         assert_eq!(context_manager.capacity, 5);
         assert_eq!(context_manager.current_index, 2);
+        assert!(context_manager.titles.titles.contains_key(&2));
     }
 
     #[test]

@@ -63,10 +63,38 @@ pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
     Some(ContextTitleExtra { program })
 }
 
+#[inline]
+fn normalize_program_name(program: &str) -> String {
+    let trimmed = program.trim();
+    let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let normalized = basename.trim_start_matches('-').to_ascii_lowercase();
+    normalized
+        .strip_suffix(".exe")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+#[inline]
+fn program_icon(program: &str) -> &'static str {
+    match normalize_program_name(program).as_str() {
+        "nvim" => "\u{e62b}",
+        "sh" | "ash" | "bash" | "dash" | "fish" | "ksh" | "mksh" | "nu" | "pwsh"
+        | "powershell" | "xonsh" | "zsh" => "\u{e795}",
+        "git" | "lazygit" => "\u{e702}",
+        "node" | "nodejs" => "\u{e718}",
+        "python" | "python3" => "\u{e73c}",
+        "docker" => "\u{f308}",
+        "rustc" | "cargo" | "rust" => "\u{e7a8}",
+        "terraform" => "\u{e69a}",
+        _ => "",
+    }
+}
+
 // Possible options:
 
 // - `TITLE`: terminal title via OSC sequences for setting terminal title
 // - `PROGRAM`: (e.g `fish`, `zsh`, `bash`, `vim`, etc...)
+// - `PROGRAM_ICON`: icon derived from the foreground process name
 // - `ABSOLUTE_PATH`: (e.g `/Users/rapha/Documents/a/rio`)
 // - `RELATIVE_PATH`: (e.g `~/Documents/a/rio` or `…/a/psone/starpsx`)
 // - `COLUMNS`: current columns
@@ -172,15 +200,28 @@ pub fn update_title<T: rio_backend::event::EventListener>(
                 }
                 "program" => {
                     #[cfg(unix)]
-                    {
-                        let program = teletypewriter::foreground_process_name(
-                            *context.main_fd,
-                            context.shell_pid,
-                        );
+                    let program = teletypewriter::foreground_process_name(
+                        *context.main_fd,
+                        context.shell_pid,
+                    );
+                    #[cfg(not(unix))]
+                    let program = String::default();
 
-                        new_template = new_template.replace(to_replace_str, &program);
-                        matched = true;
-                    }
+                    new_template = new_template.replace(to_replace_str, &program);
+                    matched = true;
+                }
+                "program_icon" => {
+                    #[cfg(unix)]
+                    let program = teletypewriter::foreground_process_name(
+                        *context.main_fd,
+                        context.shell_pid,
+                    );
+                    #[cfg(not(unix))]
+                    let program = String::default();
+
+                    new_template =
+                        new_template.replace(to_replace_str, program_icon(&program));
+                    matched = true;
                 }
                 "absolute_path" => {
                     {
@@ -421,5 +462,25 @@ pub mod test {
 
         // 3 components stays as-is
         assert_eq!(shorten_path("/a/b/c"), "/a/b/c");
+    }
+
+    #[test]
+    fn test_program_icon() {
+        assert_eq!(program_icon("nvim"), "\u{e62b}");
+        assert_eq!(program_icon("zsh"), "\u{e795}");
+        assert_eq!(program_icon("bash"), "\u{e795}");
+        assert_eq!(program_icon("fish"), "\u{e795}");
+        assert_eq!(program_icon("pwsh"), "\u{e795}");
+        assert_eq!(program_icon("-zsh"), "\u{e795}");
+        assert_eq!(program_icon("/bin/zsh"), "\u{e795}");
+        assert_eq!(program_icon("NVIM.EXE"), "\u{e62b}");
+        assert_eq!(program_icon("git"), "\u{e702}");
+        assert_eq!(program_icon("lazygit"), "\u{e702}");
+        assert_eq!(program_icon("node"), "\u{e718}");
+        assert_eq!(program_icon("python3"), "\u{e73c}");
+        assert_eq!(program_icon("docker"), "\u{f308}");
+        assert_eq!(program_icon("cargo"), "\u{e7a8}");
+        assert_eq!(program_icon("terraform"), "\u{e69a}");
+        assert_eq!(program_icon("unknown-tool"), "");
     }
 }
